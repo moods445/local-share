@@ -10,11 +10,20 @@ interface BrowserClient {
   ws: WebSocket;
   id: string;
   nickname: string;
+  networkId: string;
 }
 
 interface ClientView {
   clientId: string;
   nickname: string;
+}
+
+export interface RelayOptions {
+  /**
+   * 是否在受信反向代理之后解析 X-Forwarded-For。
+   * 直连部署保持 false，否则客户端可以伪造来源地址混入其他网络组。
+   */
+  trustProxy?: boolean;
 }
 
 const MAX_NICKNAME = 40;
@@ -24,24 +33,109 @@ function cleanNickname(value: unknown): string {
   return value.trim().slice(0, MAX_NICKNAME);
 }
 
+/** 去掉 IPv4-mapped IPv6 前缀（::ffff:1.2.3.4 → 1.2.3.4）。 */
+function normalizeAddress(raw: string): string {
+  return raw.replace(/^::ffff:/i, '');
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return false;
+  const nums = parts.map((part) => Number(part));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const [a, b] = nums;
+  return (
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+/**
+ * 分组键，按服务器所处位置自动适配：
+ * - 回环地址：全部同组（本机多标签页/本地调试）。
+ * - 私网地址：服务器就在这个局域网里，来源是各设备自己的 IP，因此按 /24（IPv4）
+ *   或 /64（IPv6 ULA/链路本地）归组，同一局域网的不同设备才会落在一起。
+ * - 公网地址：服务器在公网/云上，来源是 NAT 之后的出口 IP，按完整地址归组，
+ *   不同局域网自然隔开。
+ */
+function groupKey(ip: string): string {
+  if (ip === '127.0.0.1' || ip === '::1') return 'loopback';
+  if (ip.includes(':')) {
+    const head = ip.split(':')[0].toLowerCase();
+    if (/^f[cd]/.test(head)) return `lan:v6:${ip.split(':').slice(0, 4).join(':')}`;
+    if (/^fe[89ab]/.test(head)) return 'lan:v6:link-local';
+    return `wan:v6:${ip}`;
+  }
+  if (!isPrivateIpv4(ip)) return `wan:v4:${ip}`;
+  return `lan:v4:${privateIpv4Block(ip)}`;
+}
+
+/** 按 RFC1918 自然边界归组：10/8、172.16/12、192.168/16，回环与链路本地各自成组。 */
+function privateIpv4Block(ip: string): string {
+  const [a, b] = ip.split('.').map(Number);
+  if (a === 127) return 'loopback';
+  if (a === 10) return '10';
+  if (a === 172 && b >= 16 && b <= 31) return '172.16-31';
+  if (a === 192 && b === 168) return '192.168';
+  if (a === 169 && b === 254) return '169.254';
+  return ip;
+}
+
 /**
  * 中心信令中继：只负责转发浏览器之间的 WebRTC 信令与成员上下线事件。
  * 服务器本身不是群成员，不持有消息、文件，也不代表任何设备加入群聊。
+ *
+ * 成员按网络分组隔离：服务器按来源地址归组（局域网内按网段，公网按完整出口
+ * 地址），同组客户端才互相可见；跨组既不发送成员列表，也不转发信令。
  */
 export class Relay {
   private browserWss = new WebSocketServer({ noServer: true });
-  private browsers = new Map<string, BrowserClient>();
+  private rooms = new Map<string, Map<string, BrowserClient>>();
+  private trustProxy: boolean;
+
+  constructor(options: RelayOptions = {}) {
+    this.trustProxy = options.trustProxy ?? false;
+  }
 
   handleUpgrade(req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer): void {
-    const url = new URL(req.url ?? '/', 'http://localhost');
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      socket.destroy();
+      return;
+    }
     if (url.pathname === '/browser') {
-      this.browserWss.handleUpgrade(req, socket, head, (ws) => this.onBrowser(ws));
+      const networkId = this.networkIdOf(req);
+      this.browserWss.handleUpgrade(req, socket, head, (ws) => this.onBrowser(ws, networkId));
     } else {
       socket.destroy();
     }
   }
 
-  private onBrowser(ws: WebSocket): void {
+  /** 服务端观察到的来源地址，作为同网分组依据。 */
+  private networkIdOf(req: IncomingMessage): string {
+    const forwarded = req.headers['x-forwarded-for'];
+    const raw =
+      this.trustProxy && typeof forwarded === 'string' && forwarded.trim()
+        ? forwarded.split(',')[0].trim()
+        : (req.socket.remoteAddress ?? '');
+    return groupKey(normalizeAddress(raw));
+  }
+
+  private roomOf(networkId: string): Map<string, BrowserClient> {
+    let room = this.rooms.get(networkId);
+    if (!room) {
+      room = new Map();
+      this.rooms.set(networkId, room);
+    }
+    return room;
+  }
+
+  private onBrowser(ws: WebSocket, networkId: string): void {
     let clientId = '';
 
     ws.on('message', (raw) => {
@@ -51,53 +145,66 @@ export class Relay {
       } catch {
         return;
       }
+      if (!msg || typeof msg !== 'object') return;
 
       if (msg.t === 'register' && typeof msg.clientId === 'string' && msg.clientId) {
+        const room = this.roomOf(networkId);
+        if (clientId && clientId !== msg.clientId) {
+          const old = room.get(clientId);
+          if (old?.ws === ws) room.delete(clientId);
+        }
         clientId = msg.clientId;
-        const previous = this.browsers.get(clientId);
+        const previous = room.get(clientId);
         if (previous && previous.ws !== ws) previous.ws.close();
         const nickname = cleanNickname(msg.nickname) || '未命名成员';
-        this.browsers.set(clientId, { ws, id: clientId, nickname });
-        this.send(ws, { t: 'init', clients: this.clientViews(clientId) });
-        this.broadcast({ t: 'client-online', clientId, nickname }, clientId);
+        room.set(clientId, { ws, id: clientId, nickname, networkId });
+        this.send(ws, { t: 'init', clients: this.clientViews(room, clientId) });
+        this.broadcast(room, { t: 'client-online', clientId, nickname }, clientId);
         return;
       }
 
-      if (!clientId || this.browsers.get(clientId)?.ws !== ws) return;
+      const client = this.rooms.get(networkId)?.get(clientId);
+      if (!client || client.ws !== ws) return;
 
       if (msg.t === 'signal' && typeof msg.toClient === 'string') {
-        const target = this.browsers.get(msg.toClient);
-        if (target) this.send(target.ws, { t: 'signal', fromClient: clientId, data: msg.data });
+        const room = this.rooms.get(networkId);
+        const target = room?.get(msg.toClient);
+        if (target && target.ws !== client.ws) {
+          this.send(target.ws, { t: 'signal', fromClient: clientId, data: msg.data });
+        }
         return;
       }
 
       if (msg.t === 'nickname') {
         const nickname = cleanNickname(msg.nickname);
         if (!nickname) return;
-        const client = this.browsers.get(clientId);
-        if (!client) return;
         client.nickname = nickname;
-        this.broadcast({ t: 'peer-nickname', clientId, nickname }, clientId);
+        const room = this.rooms.get(networkId);
+        if (room) this.broadcast(room, { t: 'peer-nickname', clientId, nickname }, clientId);
       }
     });
 
     ws.on('close', () => {
-      if (!clientId || this.browsers.get(clientId)?.ws !== ws) return;
-      this.browsers.delete(clientId);
-      this.broadcast({ t: 'client-offline', clientId });
+      const room = this.rooms.get(networkId);
+      if (!room) return;
+      const client = room.get(clientId);
+      if (!client || client.ws !== ws) return;
+      room.delete(clientId);
+      if (room.size === 0) this.rooms.delete(networkId);
+      this.broadcast(room, { t: 'client-offline', clientId });
     });
     ws.on('error', () => undefined);
   }
 
-  private clientViews(exceptId?: string): ClientView[] {
-    return [...this.browsers.values()]
+  private clientViews(room: Map<string, BrowserClient>, exceptId?: string): ClientView[] {
+    return [...room.values()]
       .filter((client) => client.id !== exceptId)
       .map((client) => ({ clientId: client.id, nickname: client.nickname }));
   }
 
-  private broadcast(msg: JsonMessage, exceptId?: string): void {
+  private broadcast(room: Map<string, BrowserClient>, msg: JsonMessage, exceptId?: string): void {
     const payload = JSON.stringify(msg);
-    for (const client of this.browsers.values()) {
+    for (const client of room.values()) {
       if (client.id === exceptId) continue;
       if (client.ws.readyState === WebSocket.OPEN) client.ws.send(payload);
     }

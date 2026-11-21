@@ -19,6 +19,7 @@ export class Discovery {
   private timer?: NodeJS.Timeout;
   private hooks: DiscoveryHooks;
   private port: number;
+  private started = false;
 
   constructor(port: number, hooks: DiscoveryHooks) {
     this.port = port;
@@ -30,6 +31,8 @@ export class Discovery {
     this.socket.on('message', (msg, rinfo) => this.handle(msg, rinfo));
     this.socket.on('error', (err) => console.error('[discovery] socket error:', err.message));
     this.socket.bind(this.port, () => {
+      this.started = true;
+      this.port = (this.socket.address() as { port: number }).port;
       this.socket.setBroadcast(true);
       this.broadcast();
       this.timer = setInterval(() => {
@@ -69,6 +72,7 @@ export class Discovery {
     } catch {
       return;
     }
+    if (!data || typeof data !== 'object') return;
     if (data.t !== 'hello' || !data.device || data.device === this.hooks.getSelf().device) return;
     if (!data.port) return;
 
@@ -104,6 +108,8 @@ export class Discovery {
   }
 
   stop(): void {
+    if (!this.started) return;
+    this.started = false;
     if (this.timer) clearInterval(this.timer);
     this.socket.close();
   }

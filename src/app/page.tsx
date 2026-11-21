@@ -63,6 +63,7 @@ export default function Home() {
   const connectedRef = useRef(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const bubbleListRef = useRef<HTMLDivElement>(null);
+  const objectUrlsRef = useRef<Set<string>>(new Set());
   const [self, setSelf] = useState<SelfView>({ clientId: '', nickname: '', connected: false });
   const [peers, setPeers] = useState<PeerView[]>([]);
   const [items, setItems] = useState<TimelineItem[]>([]);
@@ -76,6 +77,7 @@ export default function Home() {
   useEffect(() => {
     const mesh = new ShareMesh(serverWebSocketUrl(), {
       onItem: (item) => {
+        if (item.url) objectUrlsRef.current.add(item.url);
         setItems((prev) => {
           const index = prev.findIndex((entry) => entry.id === item.id);
           if (index < 0) return [...prev, item];
@@ -101,6 +103,10 @@ export default function Home() {
     return () => {
       clearTimeout(timer);
       mesh.stop();
+      for (const url of objectUrlsRef.current) {
+        URL.revokeObjectURL(url);
+      }
+      objectUrlsRef.current.clear();
     };
   }, []);
 
@@ -320,7 +326,9 @@ export default function Home() {
                     <Avatar name={peer.nickname} />
                     <div className="peer-name">
                       <strong>{peer.nickname}</strong>
-                      <small>在线成员</small>
+                      <small className={peer.state === 'connected' ? 'peer-state ok' : 'peer-state'}>
+                        {peer.state === 'connected' ? '已连接 · 可直连' : '连接中…'}
+                      </small>
                     </div>
                   </div>
                 ))}

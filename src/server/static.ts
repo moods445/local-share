@@ -23,7 +23,13 @@ const MIME: Record<string, string> = {
 export function createStaticHandler(root: string): (req: IncomingMessage, res: ServerResponse) => void {
   const resolvedRoot = path.resolve(root);
   return (req, res) => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      res.writeHead(400).end('Bad request');
+      return;
+    }
     let pathname: string;
     try {
       pathname = decodeURIComponent(url.pathname);
@@ -53,6 +59,9 @@ export function createStaticHandler(root: string): (req: IncomingMessage, res: S
       'Content-Type': MIME[ext] ?? 'application/octet-stream',
       'Cache-Control': 'no-cache',
     });
-    fs.createReadStream(filePath).pipe(res);
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => res.destroy());
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
   };
 }

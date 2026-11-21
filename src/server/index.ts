@@ -18,14 +18,20 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   process.exit(1);
 }
 
-const relay = new Relay();
+const relay = new Relay({ trustProxy: process.env.TRUST_PROXY === '1' });
 const server = http.createServer(createStaticHandler(staticDir));
 server.on('upgrade', (req, socket, head) => relay.handleUpgrade(req, socket, head));
+
+server.on('error', (err) => {
+  console.error('服务器启动失败:', err.message);
+  process.exit(1);
+});
 
 server.listen(port, () => {
   console.log('local-share 群聊服务器已启动');
   console.log(`  页面地址: http://localhost:${port}`);
-  console.log('  局域网内其他设备打开该页面地址即可自动进群');
+  console.log('  同一局域网的设备（同一公网出口）打开该页面地址即可自动进群');
+  console.log('  跨网络默认隔离：仅同一来源出口的客户端互相可见；反代部署可设 TRUST_PROXY=1');
   console.log('  每个浏览器客户端都是独立成员，服务器仅转发信令');
 });
 

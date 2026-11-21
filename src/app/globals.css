@@ -580,6 +580,10 @@ input:focus {
   color: var(--muted);
 }
 
+.peer-name small.peer-state.ok {
+  color: var(--accent-2);
+}
+
 .hint {
   font-size: 11px;
   color: var(--muted);

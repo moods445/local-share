@@ -3,7 +3,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import { createStaticHandler } from './static.js';
+
+function rawRequest(port: number, target: string): Promise<string> {
+  return new Promise((resolve) => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+    });
+    let data = '';
+    sock.on('data', (chunk) => {
+      data += chunk.toString();
+    });
+    sock.on('error', () => undefined);
+    sock.on('close', () => resolve(data));
+    setTimeout(() => resolve(data), 1500);
+  });
+}
 
 describe('static handler', () => {
   let dir: string;
@@ -50,6 +66,26 @@ describe('static handler', () => {
     const res = await fetch(`${base}/..%2f..%2fetc/passwd`);
     expect(res.status).toBe(403);
   });
+
+  it('畸形请求地址返回 400 且不崩溃', async () => {
+    const response = await rawRequest(new URL(base).port, '//[%2f');
+    expect(response.split('\r\n')[0]).toBe('HTTP/1.1 400 Bad Request');
+    const res = await fetch(`${base}/`);
+    expect(res.status).toBe(200);
+  });
+
+  (typeof process.getuid === 'function' && process.getuid() === 0 ? it.skip : it)(
+    '文件不可读时断开响应而不是崩溃',
+    async () => {
+      const file = path.join(dir, 'locked.txt');
+      fs.writeFileSync(file, 'secret');
+      fs.chmodSync(file, 0o000);
+      await expect(fetch(`${base}/locked.txt`)).rejects.toThrow();
+      const res = await fetch(`${base}/`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('<h1>home</h1>');
+    },
+  );
 
   it('缺少文件时返回 404', async () => {
     const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'lsa-empty-'));

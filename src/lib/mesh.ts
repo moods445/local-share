@@ -21,9 +21,13 @@ export interface TimelineItem {
   url?: string;
 }
 
+/** 成员直连通道状态：发现后尚未建立 DataChannel 时为 connecting */
+export type PeerState = 'connecting' | 'connected';
+
 export interface PeerView {
   clientId: string;
   nickname: string;
+  state: PeerState;
 }
 
 export interface SelfView {
@@ -58,6 +62,7 @@ interface Incoming {
   meta: MetaFrame;
   chunks: Array<ArrayBuffer | undefined>;
   received: number;
+  from: string;
 }
 
 interface SignalData {
@@ -215,6 +220,7 @@ export class ShareMesh {
   setNickname(nickname: string): void {
     this.nickname = nickname;
     storageSet(NICKNAME_KEY, nickname);
+    this.broadcastControl({ k: 'nickname', nickname });
     this.sendToAgent({ t: 'nickname', nickname });
     this.emitSelf();
   }
@@ -269,13 +275,14 @@ export class ShareMesh {
       size: payload.byteLength,
       progress: 0,
       delivered: 0,
-      total: channels.length,
+      // 分母是「已发现的成员数」而不是「已建通道数」，未连通的成员算作未送达
+      total: this.peers.size,
       ...extra,
     };
     this.items.set(id, item);
     this.updateItem(item);
 
-    if (channels.length === 0) {
+    if (this.peers.size === 0) {
       this.updateItem({ ...item, status: 'failed' });
       return;
     }
@@ -287,12 +294,18 @@ export class ShareMesh {
       if (cancelled || dc.readyState !== 'open') break;
       dc.send(JSON.stringify(meta));
       for (let index = 0; index < chunkCount; index += 1) {
-        const current = this.items.get(id);
+        let current = this.items.get(id);
         if (!current || current.status === 'cancelled') {
           cancelled = true;
           break;
         }
         await waitForDrain(dc);
+        // 背压等待期间状态可能被取消或 ACK 更新，必须重新读取最新项
+        current = this.items.get(id);
+        if (!current || current.status === 'cancelled') {
+          cancelled = true;
+          break;
+        }
         if (dc.readyState !== 'open') {
           cancelled = true;
           break;
@@ -305,7 +318,6 @@ export class ShareMesh {
       }
       if (cancelled) break;
     }
-    if (cancelled) return;
     const current = this.items.get(id);
     if (!current || current.status !== 'sending') return;
     this.updateItem({
@@ -338,6 +350,9 @@ export class ShareMesh {
       for (const pc of this.pcs.values()) pc.close();
       this.pcs.clear();
       this.channels.clear();
+      this.makingOffer.clear();
+      this.ignoringOffer.clear();
+      this.abortIncoming();
       if (!this.stopped) {
         this.reconnectTimer = setTimeout(() => this.connect(), 2000);
       }
@@ -385,7 +400,7 @@ export class ShareMesh {
 
   private addRemoteClient(clientId: string, nickname: string): void {
     if (clientId === this.clientId || this.peers.has(clientId)) return;
-    this.peers.set(clientId, { clientId, nickname });
+    this.peers.set(clientId, { clientId, nickname, state: 'connecting' });
     this.emitPeers();
     this.setupPeer(clientId);
   }
@@ -398,6 +413,7 @@ export class ShareMesh {
     this.channels.delete(clientId);
     this.makingOffer.delete(clientId);
     this.ignoringOffer.delete(clientId);
+    this.abortIncoming(clientId);
     this.emitPeers();
   }
 
@@ -443,7 +459,21 @@ export class ShareMesh {
         this.handleChunk(event.data, clientId);
       }
     };
-    dc.onclose = () => this.channels.delete(clientId);
+    dc.onopen = () => {
+      const peer = this.peers.get(clientId);
+      if (peer && peer.state !== 'connected') {
+        peer.state = 'connected';
+        this.emitPeers();
+      }
+    };
+    dc.onclose = () => {
+      this.channels.delete(clientId);
+      const peer = this.peers.get(clientId);
+      if (peer && peer.state === 'connected') {
+        peer.state = 'connecting';
+        this.emitPeers();
+      }
+    };
   }
 
   private async handleSignal(clientId: string, data: SignalData): Promise<void> {
@@ -496,7 +526,7 @@ export class ShareMesh {
       if (this.seen.has(frame.id)) return;
       this.seen.add(frame.id);
       const chunks = new Array<ArrayBuffer | undefined>(frame.chunks);
-      this.incoming.set(frame.id, { meta: frame, chunks, received: 0 });
+      this.incoming.set(frame.id, { meta: frame, chunks, received: 0, from: clientId });
       const textOnly = frame.type === 'text';
       const item: TimelineItem = {
         id: frame.id,
@@ -535,7 +565,9 @@ export class ShareMesh {
     }
     if (frame.k === 'cancel') {
       const item = this.items.get(frame.id);
-      if (item && item.direction === 'in') this.updateItem({ ...item, status: 'cancelled', progress: 0 });
+      if (item && item.direction === 'in' && item.status === 'receiving') {
+        this.updateItem({ ...item, status: 'cancelled', progress: 0 });
+      }
       this.incoming.delete(frame.id);
       return;
     }
@@ -565,6 +597,17 @@ export class ShareMesh {
     this.incoming.delete(decoded.id);
     this.updateItem({ ...item, progress: 1, status: 'received', url: URL.createObjectURL(blob) });
     if (fromClient) this.sendControlTo(fromClient, { k: 'ack', id: decoded.id });
+  }
+
+  private abortIncoming(fromClientId?: string): void {
+    for (const [id, incoming] of this.incoming) {
+      if (fromClientId && incoming.from !== fromClientId) continue;
+      this.incoming.delete(id);
+      const item = this.items.get(id);
+      if (item && item.direction === 'in' && item.status === 'receiving') {
+        this.updateItem({ ...item, status: 'cancelled', progress: 0 });
+      }
+    }
   }
 
   private broadcastControl(frame: ControlFrame): void {

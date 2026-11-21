@@ -81,4 +81,36 @@ describe('discovery', () => {
     sender.close();
     expect(hooks.onPeerChanged).toHaveBeenCalledWith(expect.objectContaining({ device: 'p', port: 3999 }));
   });
+
+  it('null 或畸形 UDP 包不会导致服务崩溃', async () => {
+    discovery = new Discovery(port, hooks);
+    discovery.start();
+    await new Promise((r) => setTimeout(r, 100));
+
+    const sender = dgram.createSocket('udp4');
+    const send = (payload: string) => new Promise<void>((resolve) => {
+      sender.send(Buffer.from(payload), port, '127.0.0.1', () => resolve());
+    });
+    await send('null');
+    await send('123');
+    await send('"文本"');
+    await send('[]');
+    await send('不是 JSON');
+    await send('{"t":"hello"}');
+    await send('{"t":"hello","device":"peer-null","nickname":"邻居","port":3001}');
+    await new Promise((r) => setTimeout(r, 150));
+    sender.close();
+
+    expect(hooks.onPeer).toHaveBeenCalledTimes(1);
+    expect(discovery.list()).toHaveLength(1);
+  });
+
+  it('端口 0 时绑定系统分配端口并可正常停止', async () => {
+    discovery = new Discovery(0, hooks);
+    discovery.start();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(discovery.list()).toEqual([]);
+    expect(() => discovery?.stop()).not.toThrow();
+    expect(() => discovery?.stop()).not.toThrow();
+  });
 });
