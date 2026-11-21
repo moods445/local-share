@@ -111,9 +111,8 @@ export class Relay {
     if (url.pathname === '/browser') {
       const networkId = this.networkIdOf(req);
       this.browserWss.handleUpgrade(req, socket, head, (ws) => this.onBrowser(ws, networkId));
-    } else {
-      socket.destroy();
     }
+    // 其余升级请求（如 Next 开发模式的 /_next/webpack-hmr）交给服务器上其他监听者处理
   }
 
   /** 服务端观察到的来源地址，作为同网分组依据。 */

@@ -17,7 +17,7 @@ npm start
 - 每个浏览器客户端都是群里的**独立成员**，昵称保存在各自浏览器中，互不影响。
 - 服务器只负责托管页面和转发 WebRTC 信令，**不保存也不中转任何消息或文件**；内容在成员之间直连传输。
 - 服务器按来源地址自动分组：局域网内按 RFC1918 私网块边界（10/8、172.16/12、192.168/16），公网部署按完整出口 IP；跨组默认互相不可见、信令也不转发。反代部署可设 `TRUST_PROXY=1` 读取 `X-Forwarded-For`。
-- 如果页面从其他地址打开（例如 Cloudflare Pages），可在网址后加参数指定信令服务器：
+- 如果页面不是由这台服务器直接提供（例如放在别的地址或用反代），可在网址后加参数指定信令服务器：
   `?agentWs=ws://<服务器IP>:3000/browser`
 
 ## 开发
@@ -26,7 +26,7 @@ npm start
 npm run dev
 ```
 
-先构建前端，再启动唯一的群聊服务器（默认 3000 端口，同时托管页面与信令）。类型检查、测试与构建：
+以开发模式启动同一个 Next.js 服务（默认 3000 端口，页面与信令同进程，改代码自动热重载）。类型检查、测试与构建：
 
 ```bash
 npm run typecheck
@@ -40,9 +40,9 @@ npm run build
 
 - `src/app/` 前端页面
 - `src/lib/` 群聊共享逻辑（成员、信令、传输）
-- `src/server/` 唯一的 Node 服务器（托管页面 + WebSocket 信令）
-- `out/` 前端静态产物，`dist/` 服务端编译产物
+- `src/server/` 自定义 Next.js 服务器（一个进程同时提供页面 + WebSocket 信令）
+- `.next/` 前端构建产物，`dist/` 服务端编译产物
 
 ## 技术
 
-Next.js 静态导出 + Node.js WebSocket 信令中继 + WebRTC DataChannel 点对点传输。
+Next.js（自定义 Node 服务器）+ WebSocket 信令中继 + WebRTC DataChannel 点对点传输。页面与信令同一个进程、同一个端口。
