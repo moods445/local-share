@@ -1,5 +1,7 @@
 'use client';
 
+import { initTelemetry, report, setTelemetryContext } from './telemetry';
+
 export type ContentType = 'text' | 'image' | 'file';
 export type ItemStatus = 'sending' | 'sent' | 'partial' | 'receiving' | 'received' | 'failed' | 'cancelled';
 
@@ -34,6 +36,8 @@ export interface SelfView {
   clientId: string;
   nickname: string;
   connected: boolean;
+  /** 本页面的身份被同一浏览器的另一个标签页接管，已主动断开且不再重连 */
+  replaced: boolean;
 }
 
 export interface MeshEvents {
@@ -74,6 +78,8 @@ const CHUNK_SIZE = 16 * 1024;
 const ID_BYTES = 36;
 const HEADER_BYTES = ID_BYTES + 4;
 const BUFFERED_LIMIT = 1 << 20;
+const CONNECT_TIMEOUT_MS = 5000;
+const RECONNECT_DELAY_MS = 2000;
 const CLIENT_ID_KEY = 'local-share.client-id';
 const NICKNAME_KEY = 'local-share.nickname';
 
@@ -95,11 +101,32 @@ function storageSet(key: string, value: string): void {
   }
 }
 
+function sessionGet(key: string): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function sessionSet(key: string, value: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(key, value);
+  } catch {
+    // 隐私模式下 sessionStorage 可能不可用，身份仅保留在内存中
+  }
+}
+
 function loadClientId(): string {
-  const stored = storageGet(CLIENT_ID_KEY);
+  // clientId 按标签页隔离（sessionStorage）：同一浏览器多开标签页时若共用
+  // localStorage 中的 id，服务端会反复关闭旧连接、旧页面又不断重连，形成
+  // “一直正在连接群服务器…”的死循环。
+  const stored = sessionGet(CLIENT_ID_KEY);
   if (stored) return stored;
   const id = uuid();
-  storageSet(CLIENT_ID_KEY, id);
+  sessionSet(CLIENT_ID_KEY, id);
   return id;
 }
 
@@ -196,6 +223,9 @@ export class ShareMesh {
   private seen = new Set<string>();
   private items = new Map<string, TimelineItem>();
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private connectTimer?: ReturnType<typeof setTimeout>;
+  private attempts = 0;
+  private replaced = false;
   private stopped = false;
   private events: MeshEvents;
 
@@ -205,12 +235,17 @@ export class ShareMesh {
 
   start(): void {
     this.stopped = false;
+    initTelemetry(this.agentUrl);
+    setTelemetryContext({ clientId: this.clientId, nickname: this.nickname });
+    report('info', 'mesh.start', { url: this.agentUrl });
     this.connect();
   }
 
   stop(): void {
     this.stopped = true;
+    report('info', 'mesh.stop');
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.connectTimer) clearTimeout(this.connectTimer);
     this.socket?.close();
     for (const pc of this.pcs.values()) pc.close();
     this.pcs.clear();
@@ -220,6 +255,8 @@ export class ShareMesh {
   setNickname(nickname: string): void {
     this.nickname = nickname;
     storageSet(NICKNAME_KEY, nickname);
+    setTelemetryContext({ nickname });
+    report('info', 'nickname.change', { nickname });
     this.broadcastControl({ k: 'nickname', nickname });
     this.sendToAgent({ t: 'nickname', nickname });
     this.emitSelf();
@@ -328,9 +365,27 @@ export class ShareMesh {
 
   private connect(): void {
     if (this.stopped) return;
+    const attempt = (this.attempts += 1);
+    report('info', 'ws.connecting', { attempt, url: this.agentUrl });
     const socket = new WebSocket(this.agentUrl);
     this.socket = socket;
+    let settled = false;
+    this.connectTimer = setTimeout(() => {
+      if (settled || this.socket !== socket) return;
+      report('warn', 'ws.connect_timeout', {
+        attempt,
+        readyState: socket.readyState,
+        timeoutMs: CONNECT_TIMEOUT_MS,
+      });
+    }, CONNECT_TIMEOUT_MS);
+    const settle = () => {
+      settled = true;
+      if (this.connectTimer) clearTimeout(this.connectTimer);
+    };
+
     socket.onopen = () => {
+      settle();
+      report('info', 'ws.open', { attempt });
       this.emitSelf(true);
       this.sendToAgent({ t: 'register', clientId: this.clientId, nickname: this.nickname });
     };
@@ -339,11 +394,19 @@ export class ShareMesh {
       try {
         msg = JSON.parse(String(event.data)) as Record<string, unknown>;
       } catch {
+        report('warn', 'ws.bad_message');
         return;
       }
       this.onAgentMessage(msg);
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
+      settle();
+      report(event.wasClean ? 'info' : 'warn', 'ws.close', {
+        attempt,
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+      });
       this.emitSelf(false);
       this.peers.clear();
       this.events.onPeers([]);
@@ -353,17 +416,21 @@ export class ShareMesh {
       this.makingOffer.clear();
       this.ignoringOffer.clear();
       this.abortIncoming();
-      if (!this.stopped) {
-        this.reconnectTimer = setTimeout(() => this.connect(), 2000);
+      if (!this.stopped && !this.replaced) {
+        report('info', 'ws.reconnect', { delayMs: RECONNECT_DELAY_MS, nextAttempt: this.attempts + 1 });
+        this.reconnectTimer = setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
       }
     };
-    socket.onerror = () => undefined;
+    socket.onerror = () => {
+      report('warn', 'ws.error', { attempt, readyState: socket.readyState });
+    };
   }
 
   private onAgentMessage(msg: Record<string, unknown>): void {
     switch (msg.t) {
       case 'init': {
         const clients = (msg.clients as Array<{ clientId: string; nickname: string }>) ?? [];
+        report('info', 'ws.init', { peers: clients.length });
         for (const client of clients) {
           this.addRemoteClient(String(client.clientId), String(client.nickname || '未命名成员'));
         }
@@ -371,11 +438,21 @@ export class ShareMesh {
         this.emitPeers();
         break;
       }
+      case 'replaced': {
+        // 同一 clientId 已被另一个连接接管：本页停止重连，避免两个页面互相踢
+        this.replaced = true;
+        report('warn', 'ws.replaced', { attempt: this.attempts });
+        this.emitSelf(false);
+        this.socket?.close(4001, 'replaced');
+        break;
+      }
       case 'client-online': {
+        report('debug', 'peer.online', { clientId: String(msg.clientId) });
         this.addRemoteClient(String(msg.clientId), String(msg.nickname || '未命名成员'));
         break;
       }
       case 'client-offline': {
+        report('debug', 'peer.offline', { clientId: String(msg.clientId) });
         this.removeRemoteClient(String(msg.clientId));
         break;
       }
@@ -386,6 +463,19 @@ export class ShareMesh {
         if (peer) {
           peer.nickname = nickname;
           this.emitPeers();
+        }
+        break;
+      }
+      case 'nickname-assigned': {
+        // 服务器在本机昵称与群内其他成员重复时分配了带 5 位随机码的昵称
+        const nickname = String(msg.nickname);
+        if (nickname && nickname !== this.nickname) {
+          this.nickname = nickname;
+          storageSet(NICKNAME_KEY, nickname);
+          setTelemetryContext({ nickname });
+          report('info', 'nickname.assigned', { nickname });
+          this.broadcastControl({ k: 'nickname', nickname });
+          this.emitSelf();
         }
         break;
       }
@@ -460,6 +550,7 @@ export class ShareMesh {
       }
     };
     dc.onopen = () => {
+      report('info', 'peer.channel_open', { clientId });
       const peer = this.peers.get(clientId);
       if (peer && peer.state !== 'connected') {
         peer.state = 'connected';
@@ -467,6 +558,7 @@ export class ShareMesh {
       }
     };
     dc.onclose = () => {
+      report('info', 'peer.channel_closed', { clientId });
       this.channels.delete(clientId);
       const peer = this.peers.get(clientId);
       if (peer && peer.state === 'connected') {
@@ -511,6 +603,10 @@ export class ShareMesh {
       }
     } catch (error) {
       console.error('[mesh] signal handling failed', error);
+      report('error', 'signal.failed', {
+        clientId,
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -639,6 +735,7 @@ export class ShareMesh {
       clientId: this.clientId,
       nickname: this.nickname,
       connected: connected ?? this.socket?.readyState === WebSocket.OPEN,
+      replaced: this.replaced,
     });
   }
 }

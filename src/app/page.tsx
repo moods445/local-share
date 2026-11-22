@@ -64,7 +64,7 @@ export default function Home() {
   const fileRef = useRef<HTMLInputElement>(null);
   const bubbleListRef = useRef<HTMLDivElement>(null);
   const objectUrlsRef = useRef<Set<string>>(new Set());
-  const [self, setSelf] = useState<SelfView>({ clientId: '', nickname: '', connected: false });
+  const [self, setSelf] = useState<SelfView>({ clientId: '', nickname: '', connected: false, replaced: false });
   const [peers, setPeers] = useState<PeerView[]>([]);
   const [items, setItems] = useState<TimelineItem[]>([]);
   const [nickname, setNickname] = useState('');
@@ -165,11 +165,13 @@ export default function Home() {
           <h1>局域网共享群</h1>
           <p>
             <span className={`dot ${self.connected ? 'on' : ''}`} />
-            {self.connected
-              ? `${memberCount} 位成员在线 · 实时共享`
-              : connectFailed
-                ? '连接失败：请确认访问的是群服务器地址'
-                : '正在连接群服务器…'}
+            {self.replaced
+              ? '本页面已在另一个标签页打开，已停止连接'
+              : self.connected
+                ? `${memberCount} 位成员在线 · 实时共享`
+                : connectFailed
+                  ? '连接失败：请确认访问的是群服务器地址'
+                  : '正在连接群服务器…'}
           </p>
         </div>
         <button
@@ -308,7 +310,7 @@ export default function Home() {
                 />
                 <button className="btn primary" type="button" onClick={saveNickname}>保存</button>
               </div>
-              <p className="hint">昵称只保存在当前浏览器，不影响其他成员。</p>
+              <p className="hint">昵称只保存在当前浏览器；若与群内其他成员重名，会自动在后面追加 5 位随机码区分。</p>
             </div>
 
             <div className="drawer-section">

@@ -1,9 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import http from 'node:http';
+import pino from 'pino';
 import { WebSocket } from 'ws';
 import { Relay } from './relay.js';
 
 type Msg = Record<string, unknown>;
+
+const silentLogger = pino({ level: 'silent' });
 
 interface Client {
   ws: WebSocket;
@@ -25,7 +28,7 @@ describe('relay 网络分组隔离', () => {
 
   beforeEach(async () => {
     // 模拟位于可信反代之后，来源网络取自 X-Forwarded-For
-    relay = new Relay({ trustProxy: true });
+    relay = new Relay({ trustProxy: true, logger: silentLogger });
     server = http.createServer((_req, res) => {
       res.writeHead(404).end('no');
     });
@@ -173,6 +176,15 @@ describe('relay 网络分组隔离', () => {
     await delay(150);
     expect(a.messages.some((m) => m.t === 'client-online')).toBe(false);
     expect(b.messages.some((m) => m.t === 'client-online')).toBe(false);
+  });
+
+  it('昵称去重只在同一网络组内进行', async () => {
+    const a = await connect(NET_A);
+    await register(a, 'A', '甲');
+
+    const b = await connect(NET_B);
+    expect(await register(b, 'B', '甲')).toEqual({ t: 'init', clients: [] });
+    expect(b.messages.some((m) => m.t === 'nickname-assigned')).toBe(false);
   });
 
   it('跨网络的信令被丢弃，同网络信令正常转发', async () => {

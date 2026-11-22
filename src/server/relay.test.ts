@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import http from 'node:http';
 import net from 'node:net';
+import pino from 'pino';
 import { WebSocket } from 'ws';
 import { Relay } from './relay.js';
 
 type Msg = Record<string, unknown>;
+
+const silentLogger = pino({ level: 'silent' });
 
 interface Client {
   ws: WebSocket;
@@ -37,7 +40,7 @@ describe('relay', () => {
   let clients: Client[];
 
   beforeEach(async () => {
-    relay = new Relay();
+    relay = new Relay({ logger: silentLogger });
     server = http.createServer((_req, res) => {
       res.writeHead(404).end('no');
     });
@@ -154,6 +157,85 @@ describe('relay', () => {
     expect(await aNickname).toEqual({ t: 'peer-nickname', clientId: 'B', nickname: '乙2' });
   });
 
+  it('同网昵称重复时追加 5 位随机码', async () => {
+    const a = connect();
+    await opened(a);
+    send(a, { t: 'register', clientId: 'A', nickname: '甲' });
+    expect(await next(a, (m) => m.t === 'init')).toEqual({ t: 'init', clients: [] });
+
+    const b = connect();
+    await opened(b);
+    const bInit = next(b, (m) => m.t === 'init');
+    const aOnline = next(a, (m) => m.t === 'client-online');
+    const bAssigned = next(b, (m) => m.t === 'nickname-assigned');
+    send(b, { t: 'register', clientId: 'B', nickname: '甲' });
+
+    expect(await bInit).toEqual({ t: 'init', clients: [{ clientId: 'A', nickname: '甲' }] });
+    const online = await aOnline;
+    expect(online).toEqual({
+      t: 'client-online',
+      clientId: 'B',
+      nickname: expect.stringMatching(/^甲\d{5}$/),
+    });
+    expect(await bAssigned).toEqual({ t: 'nickname-assigned', nickname: online.nickname });
+  });
+
+  it('多个成员重名时随机码互不相同', async () => {
+    const a = connect();
+    await opened(a);
+    send(a, { t: 'register', clientId: 'A', nickname: '甲' });
+    await next(a, (m) => m.t === 'init');
+
+    const b = connect();
+    await opened(b);
+    const bAssigned = next(b, (m) => m.t === 'nickname-assigned');
+    send(b, { t: 'register', clientId: 'B', nickname: '甲' });
+    await next(b, (m) => m.t === 'init');
+
+    const c = connect();
+    await opened(c);
+    const cAssigned = next(c, (m) => m.t === 'nickname-assigned');
+    send(c, { t: 'register', clientId: 'C', nickname: '甲' });
+    await next(c, (m) => m.t === 'init');
+
+    const bName = String((await bAssigned).nickname);
+    const cName = String((await cAssigned).nickname);
+    expect(bName).toMatch(/^甲\d{5}$/);
+    expect(cName).toMatch(/^甲\d{5}$/);
+    expect(bName).not.toBe(cName);
+  });
+
+  it('昵称改成与他人重复时同样追加随机码', async () => {
+    const a = connect();
+    await opened(a);
+    send(a, { t: 'register', clientId: 'A', nickname: '甲' });
+    await next(a, (m) => m.t === 'init');
+    const b = connect();
+    await opened(b);
+    send(b, { t: 'register', clientId: 'B', nickname: '乙' });
+    await next(b, (m) => m.t === 'init');
+
+    const aNickname = next(a, (m) => m.t === 'peer-nickname');
+    const bAssigned = next(b, (m) => m.t === 'nickname-assigned');
+    send(b, { t: 'nickname', nickname: '甲' });
+
+    const peer = await aNickname;
+    expect(peer).toEqual({
+      t: 'peer-nickname',
+      clientId: 'B',
+      nickname: expect.stringMatching(/^甲\d{5}$/),
+    });
+    expect(await bAssigned).toEqual({ t: 'nickname-assigned', nickname: peer.nickname });
+  });
+
+  it('昵称不重复时不发送分配消息', async () => {
+    const a = connect();
+    await opened(a);
+    send(a, { t: 'register', clientId: 'A', nickname: '甲' });
+    await next(a, (m) => m.t === 'init');
+    expect(a.messages.some((m) => m.t === 'nickname-assigned')).toBe(false);
+  });
+
   it('断开连接后广播离线', async () => {
     const a = connect();
     await opened(a);
@@ -169,7 +251,7 @@ describe('relay', () => {
     expect(await aOffline).toEqual({ t: 'client-offline', clientId: 'B' });
   });
 
-  it('重复 clientId 时关闭旧连接', async () => {
+  it('重复 clientId 时通知旧连接被替换并关闭', async () => {
     const first = connect();
     await opened(first);
     send(first, { t: 'register', clientId: 'A', nickname: '甲' });
@@ -178,10 +260,12 @@ describe('relay', () => {
     const second = connect();
     await opened(second);
     const secondInit = next(second, (m) => m.t === 'init');
+    const firstReplaced = next(first, (m) => m.t === 'replaced');
     const firstClosed = new Promise<void>((resolve) => first.ws.once('close', () => resolve()));
     send(second, { t: 'register', clientId: 'A', nickname: '甲' });
 
     expect(await secondInit).toEqual({ t: 'init', clients: [] });
+    expect(await firstReplaced).toEqual({ t: 'replaced' });
     await firstClosed;
   });
 

@@ -51,6 +51,7 @@
 - 浏览器首次打开页面时生成 UUID，存入 `localStorage`（`local-share.client-id`），刷新后保持不变。
 - 默认昵称取自浏览器所在系统信息（如 Mac、Windows、Android、iPhone、iPad），由 `navigator.userAgent` / `userAgentData` 解析；用户可修改，存入 `localStorage`（`local-share.nickname`），不影响其他成员。
 - 昵称变更由服务器广播给其他成员；历史消息保留发送当时的昵称。
+- 同一网络组内出现相同昵称时，服务器在昵称后追加 5 位随机数字（如 `张三12345`）以区分；不同网络组互不影响。
 
 ### 5.2 启动
 - 在局域网一台设备上运行 `npm run build && npm start`（默认端口 3000）。
@@ -67,7 +68,7 @@
 - **FR-6 界面**：消息气泡按时间正序排列，自己靠右、他人靠左，显示昵称、时间、传输状态；侧栏展示成员列表与昵称设置，成员区分"已连接 · 可直连"与"连接中…"（以 DataChannel 是否打开为准）。
 - **FR-7 传输反馈**：发送/接收进度条；传输中可取消；"已送达 x/y" 的 y 为**已发现的成员数**，未连通或未送达的成员计入未送达。
 - **FR-8 掉线重连**：浏览器 WS 断开后清除成员并关闭 DataChannel，2 秒后自动重连；离线期间内容不补发。
-- **FR-9 昵称管理**：昵称属于浏览器本地，修改后写入 localStorage 并同步给群内其他成员。
+- **FR-9 昵称管理**：昵称属于浏览器本地，修改后写入 localStorage 并同步给群内其他成员。同一网络组内昵称重复时，服务器在昵称后追加 5 位随机数字（如 `张三12345`）保证成员列表唯一，并把分配结果同步给该成员。
 
 ## 7. 消息格式
 
@@ -84,8 +85,11 @@
 { "t": "client-online", "clientId": "<uuid-v4>", "nickname": "<string>" }
 { "t": "client-offline", "clientId": "<uuid-v4>" }
 { "t": "peer-nickname", "clientId": "<uuid-v4>", "nickname": "<string>" }
+{ "t": "nickname-assigned", "nickname": "<string>" }
 { "t": "signal", "fromClient": "<uuid-v4>", "data": { "description": "...", "candidate": "..." } }
 ```
+
+- `nickname-assigned` 只在昵称与同组其他成员重复时下发，`nickname` 为追加 5 位随机数字后的最终昵称。
 
 ### 7.3 DataChannel 内容帧
 - 控制帧：JSON，包含 `meta`（id/type/from/fromNickname/ts/size/chunks/text/fileName/mimeType）、`ack`、`cancel`、`nickname`。
@@ -110,6 +114,7 @@
 
 1. 两台设备浏览器打开同一页面地址，自动出现在彼此成员列表中。
 2. 任一浏览器修改昵称，其他成员的界面同步更新，且各自昵称互不影响。
+2b. 两台设备以相同昵称加入同一网络组时，服务器在昵称后追加 5 位随机数字，成员列表中不重名；不同网络组互不影响。
 3. 文字、图片、文件发送后其他成员实时收到，排序正确且不重复。
 4. 发送端显示进度与"已送达 x/y"（y 为已发现成员数，未连通者计入未送达），接收端可下载文件与原图。
 4b. 同一出口的两台设备互相出现在成员列表且可收发；不同出口的两台设备互不可见，且跨组信令不被转发。

@@ -14,6 +14,10 @@ interface RunResult {
   stderr: string;
 }
 
+function output(result: RunResult): string {
+  return `${result.stdout}\n${result.stderr}`;
+}
+
 function run(args: string[]): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsxBin, [serverEntry, ...args], { cwd: root });
@@ -47,7 +51,7 @@ describe('服务启动参数', () => {
   it('非法端口报错退出', async () => {
     const result = await run(['--port', '0']);
     expect(result.code).toBe(1);
-    expect(result.stderr).toContain('无效的 HTTP 端口');
+    expect(output(result)).toContain('无效的 HTTP 端口');
   });
 
   it('端口被占用时给出错误而不是未处理异常', async () => {
@@ -55,8 +59,8 @@ describe('服务启动参数', () => {
     try {
       const result = await run(['--port', String(occupied.port)]);
       expect(result.code).toBe(1);
-      expect(result.stderr).toContain('服务器启动失败');
-      expect(result.stderr).not.toContain('Error: listen EADDRINUSE');
+      expect(output(result)).toContain('服务器启动失败');
+      expect(output(result)).not.toContain('Error: listen EADDRINUSE');
     } finally {
       await occupied.close();
     }

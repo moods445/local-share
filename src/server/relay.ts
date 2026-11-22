@@ -1,5 +1,7 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage } from 'node:http';
+import { randomInt } from 'node:crypto';
+import { logger as defaultLogger, type Logger } from './logger.js';
 
 interface JsonMessage {
   t: string;
@@ -24,6 +26,8 @@ export interface RelayOptions {
    * 直连部署保持 false，否则客户端可以伪造来源地址混入其他网络组。
    */
   trustProxy?: boolean;
+  /** 注入日志器，默认使用全局 Pino 实例。 */
+  logger?: Logger;
 }
 
 const MAX_NICKNAME = 40;
@@ -31,6 +35,27 @@ const MAX_NICKNAME = 40;
 function cleanNickname(value: unknown): string {
   if (typeof value !== 'string') return '';
   return value.trim().slice(0, MAX_NICKNAME);
+}
+
+/** 5 位随机数字，不足补零，用于昵称重复时区分。 */
+function randomSuffix(): string {
+  return randomInt(0, 100_000).toString().padStart(5, '0');
+}
+
+/**
+ * 同网成员昵称去重：昵称已被其他成员占用时，在昵称后追加 5 位随机数字。
+ * 随机码也可能恰好撞名，重试直到组内唯一。
+ */
+function dedupeNickname(room: Map<string, BrowserClient>, exceptId: string, nickname: string): string {
+  const taken = new Set(
+    [...room.values()]
+      .filter((client) => client.id !== exceptId)
+      .map((client) => client.nickname),
+  );
+  if (!taken.has(nickname)) return nickname;
+  let candidate = `${nickname}${randomSuffix()}`;
+  while (taken.has(candidate)) candidate = `${nickname}${randomSuffix()}`;
+  return candidate;
 }
 
 /** 去掉 IPv4-mapped IPv6 前缀（::ffff:1.2.3.4 → 1.2.3.4）。 */
@@ -95,9 +120,11 @@ export class Relay {
   private browserWss = new WebSocketServer({ noServer: true });
   private rooms = new Map<string, Map<string, BrowserClient>>();
   private trustProxy: boolean;
+  private logger: Logger;
 
   constructor(options: RelayOptions = {}) {
     this.trustProxy = options.trustProxy ?? false;
+    this.logger = options.logger ?? defaultLogger;
   }
 
   handleUpgrade(req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer): void {
@@ -110,6 +137,10 @@ export class Relay {
     }
     if (url.pathname === '/browser') {
       const networkId = this.networkIdOf(req);
+      this.logger.info(
+        { networkId, remote: req.socket.remoteAddress },
+        'browser websocket upgrade',
+      );
       this.browserWss.handleUpgrade(req, socket, head, (ws) => this.onBrowser(ws, networkId));
     }
     // 其余升级请求（如 Next 开发模式的 /_next/webpack-hmr）交给服务器上其他监听者处理
@@ -154,10 +185,25 @@ export class Relay {
         }
         clientId = msg.clientId;
         const previous = room.get(clientId);
-        if (previous && previous.ws !== ws) previous.ws.close();
-        const nickname = cleanNickname(msg.nickname) || '未命名成员';
+        if (previous && previous.ws !== ws) {
+          // 同一 clientId 被另一个连接占用（多标签页/页面复制）。
+          // 关闭旧连接前先通知它被替换，避免旧页面无限重连互相踢下线。
+          this.logger.warn(
+            { clientId, networkId, nickname: previous.nickname },
+            'duplicate clientId registered, replacing previous connection',
+          );
+          this.send(previous.ws, { t: 'replaced' });
+          previous.ws.close(4001, 'replaced');
+        }
+        const requested = cleanNickname(msg.nickname) || '未命名成员';
+        const nickname = dedupeNickname(room, clientId, requested);
         room.set(clientId, { ws, id: clientId, nickname, networkId });
+        this.logger.info(
+          { clientId, nickname, requested, networkId, roomSize: room.size },
+          'client registered',
+        );
         this.send(ws, { t: 'init', clients: this.clientViews(room, clientId) });
+        if (nickname !== requested) this.send(ws, { t: 'nickname-assigned', nickname });
         this.broadcast(room, { t: 'client-online', clientId, nickname }, clientId);
         return;
       }
@@ -169,17 +215,24 @@ export class Relay {
         const room = this.rooms.get(networkId);
         const target = room?.get(msg.toClient);
         if (target && target.ws !== client.ws) {
+          this.logger.debug({ from: clientId, to: msg.toClient }, 'relay signal');
           this.send(target.ws, { t: 'signal', fromClient: clientId, data: msg.data });
+        } else {
+          this.logger.debug({ from: clientId, to: msg.toClient }, 'signal target not found');
         }
         return;
       }
 
       if (msg.t === 'nickname') {
-        const nickname = cleanNickname(msg.nickname);
-        if (!nickname) return;
-        client.nickname = nickname;
+        const requested = cleanNickname(msg.nickname);
+        if (!requested) return;
         const room = this.rooms.get(networkId);
-        if (room) this.broadcast(room, { t: 'peer-nickname', clientId, nickname }, clientId);
+        if (!room) return;
+        const nickname = dedupeNickname(room, client.id, requested);
+        client.nickname = nickname;
+        this.logger.info({ clientId, nickname, requested }, 'client nickname updated');
+        this.broadcast(room, { t: 'peer-nickname', clientId, nickname }, clientId);
+        if (nickname !== requested) this.send(client.ws, { t: 'nickname-assigned', nickname });
       }
     });
 
@@ -190,9 +243,12 @@ export class Relay {
       if (!client || client.ws !== ws) return;
       room.delete(clientId);
       if (room.size === 0) this.rooms.delete(networkId);
+      this.logger.info({ clientId, networkId, roomSize: room.size }, 'client disconnected');
       this.broadcast(room, { t: 'client-offline', clientId });
     });
-    ws.on('error', () => undefined);
+    ws.on('error', (error) => {
+      this.logger.warn({ err: error, clientId, networkId }, 'browser websocket error');
+    });
   }
 
   private clientViews(room: Map<string, BrowserClient>, exceptId?: string): ClientView[] {

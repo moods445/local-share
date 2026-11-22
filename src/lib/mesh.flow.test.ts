@@ -7,7 +7,7 @@ class FakeSocket {
   readyState = 1;
   onopen: (() => void) | null = null;
   onmessage: ((e: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((e: { code: number; reason: string; wasClean: boolean }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: string[] = [];
   constructor(public url: string) {
@@ -15,7 +15,7 @@ class FakeSocket {
     queueMicrotask(() => this.onopen?.());
   }
   send(data: string) { this.sent.push(data); }
-  close() { this.readyState = 3; this.onclose?.(); }
+  close() { this.readyState = 3; this.onclose?.({ code: 1005, reason: '', wasClean: true }); }
   emit(msg: object) { this.onmessage?.({ data: JSON.stringify(msg) }); }
 }
 
@@ -271,6 +271,28 @@ describe('ShareMesh 发送/取消/确认流程', () => {
       .filter((s) => typeof s === 'string')
       .map((s) => JSON.parse(s as string)) as Array<{ k: string; nickname: string }>;
     expect(frames).toContainEqual({ k: 'nickname', nickname: '新昵称' });
+  });
+
+  it('收到服务器分配的昵称后更新本地身份并广播给成员', () => {
+    const selfEvents: SelfView[] = [];
+    mesh = new ShareMesh('ws://localhost/browser', {
+      onItem: () => {},
+      onPeers: () => {},
+      onSelf: (self) => { selfEvents.push(self); },
+    });
+    mesh.start();
+    const sock = FakeSocket.instances[0];
+    sock.onopen?.();
+    registerPeer();
+    const dc = FakePC.instances[0].dc;
+
+    sock.emit({ t: 'nickname-assigned', nickname: '甲12345' });
+    expect(selfEvents.at(-1)?.nickname).toBe('甲12345');
+
+    const frames = dc.sent
+      .filter((s) => typeof s === 'string')
+      .map((s) => JSON.parse(s as string)) as Array<{ k: string; nickname: string }>;
+    expect(frames).toContainEqual({ k: 'nickname', nickname: '甲12345' });
   });
 
   it('成员状态随 DataChannel 打开与关闭变化', () => {

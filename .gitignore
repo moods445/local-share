@@ -6,6 +6,7 @@ node_modules/
 dist/
 out/
 .next/
+.next-dev/
 *.tsbuildinfo
 
 # 日志
