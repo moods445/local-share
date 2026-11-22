@@ -1,10 +1,9 @@
 # 依赖
 node_modules/
-.pnpm-store/
+package-lock.json
+yarn.lock
 
 # 构建产物
-dist/
-out/
 .next/
 .next-dev/
 *.tsbuildinfo

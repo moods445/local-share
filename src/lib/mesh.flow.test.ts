@@ -4,14 +4,21 @@ import { ShareMesh, encodeChunk, type TimelineItem, type PeerView, type SelfView
 class FakeSocket {
   static OPEN = 1;
   static instances: FakeSocket[] = [];
-  readyState = 1;
+  readyState = 0;
   onopen: (() => void) | null = null;
   onmessage: ((e: { data: string }) => void) | null = null;
   onclose: ((e: { code: number; reason: string; wasClean: boolean }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: string[] = [];
-  constructor(public url: string) {
+  constructor(
+    public url: string,
+    public clientId?: string,
+    public nickname?: string,
+  ) {
     FakeSocket.instances.push(this);
+  }
+  connect() {
+    this.readyState = 1;
     queueMicrotask(() => this.onopen?.());
   }
   send(data: string) { this.sent.push(data); }
@@ -84,7 +91,6 @@ describe('ShareMesh 发送/取消/确认流程', () => {
   beforeEach(() => {
     FakeSocket.instances = [];
     FakePC.instances = [];
-    vi.stubGlobal('WebSocket', FakeSocket);
     vi.stubGlobal('RTCPeerConnection', FakePC);
     vi.stubGlobal('crypto', { randomUUID: () => `id-${Math.random().toString(36).slice(2)}` });
     vi.stubGlobal('URL', { createObjectURL: () => 'blob:fake', revokeObjectURL: () => {} });
@@ -97,7 +103,7 @@ describe('ShareMesh 发送/取消/确认流程', () => {
       },
       onPeers: () => {},
       onSelf: () => {},
-    });
+    }, { createSocket: (url, clientId, nickname) => new FakeSocket(url, clientId, nickname) });
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -174,16 +180,14 @@ describe('ShareMesh 发送/取消/确认流程', () => {
       onItem: () => {},
       onPeers: (peers) => { peerEvents.push(peers); },
       onSelf: (self) => { selfEvents.push(self); },
-    });
+    }, { createSocket: (url, clientId, nickname) => new FakeSocket(url, clientId, nickname) });
     mesh.start();
     const sock = FakeSocket.instances[0];
     sock.onopen?.();
 
-    const register = JSON.parse(sock.sent[0]) as { t: string; clientId: string; nickname: string };
-    expect(register.t).toBe('register');
-    expect(register.clientId).toBeTruthy();
-    expect(register.nickname).toBeTruthy();
-    expect(selfEvents.at(-1)?.clientId).toBe(register.clientId);
+    expect(sock.clientId).toBeTruthy();
+    expect(sock.nickname).toBeTruthy();
+    expect(selfEvents.at(-1)?.clientId).toBe(sock.clientId);
 
     sock.emit({ t: 'init', clients: [
       { clientId: 'a', nickname: '甲' },
@@ -223,7 +227,7 @@ describe('ShareMesh 发送/取消/确认流程', () => {
     expect(items[0].url).toBe('blob:fake');
   });
 
-  it('WS 断开后中止进行中的接收并清理协商状态', () => {
+  it('信令断开后中止进行中的接收并清理协商状态', () => {
     mesh.start();
     registerPeer();
     const sock = FakeSocket.instances[0];
@@ -279,7 +283,7 @@ describe('ShareMesh 发送/取消/确认流程', () => {
       onItem: () => {},
       onPeers: () => {},
       onSelf: (self) => { selfEvents.push(self); },
-    });
+    }, { createSocket: (url, clientId, nickname) => new FakeSocket(url, clientId, nickname) });
     mesh.start();
     const sock = FakeSocket.instances[0];
     sock.onopen?.();
@@ -301,7 +305,7 @@ describe('ShareMesh 发送/取消/确认流程', () => {
       onItem: () => {},
       onPeers: (peers) => { peerEvents.push(peers); },
       onSelf: () => {},
-    });
+    }, { createSocket: (url, clientId, nickname) => new FakeSocket(url, clientId, nickname) });
     mesh.start();
     const sock = FakeSocket.instances[0];
     sock.onopen?.();
@@ -330,5 +334,46 @@ describe('ShareMesh 发送/取消/确认流程', () => {
     expect(items[0].status).toBe('partial');
     expect(items[0].total).toBe(1);
     expect(items[0].delivered).toBe(0);
+  });
+
+  it('连接建立后补发昵称，避免连接窗口内修改丢失', async () => {
+    const selfEvents: SelfView[] = [];
+    mesh = new ShareMesh('ws://localhost/browser', {
+      onItem: () => {},
+      onPeers: () => {},
+      onSelf: (self) => { selfEvents.push(self); },
+    }, { createSocket: (url, clientId, nickname) => new FakeSocket(url, clientId, nickname) });
+    mesh.start();
+    const sock = FakeSocket.instances[0];
+    await new Promise((r) => setTimeout(r, 0));
+    const nickname = selfEvents.at(-1)?.nickname;
+    const sent = sock.sent.map((raw) => JSON.parse(raw) as { t: string; nickname?: string });
+    expect(sent).toContainEqual({ t: 'nickname', nickname, clientId: expect.any(String) });
+  });
+
+  it('DataChannel 断开后自动重建连接', async () => {
+    mesh.start();
+    registerPeer();
+    const before = FakePC.instances.length;
+    FakePC.instances[0].dc.close();
+    await new Promise((r) => setTimeout(r, 900));
+    expect(FakePC.instances.length).toBeGreaterThan(before);
+  });
+
+  it('stop() 清理成员与接收状态并复位 replaced', () => {
+    mesh.start();
+    const sock = FakeSocket.instances[0];
+    sock.onopen?.();
+    sock.emit({ t: 'init', clients: [{ clientId: 'remote-client', nickname: '对端' }] });
+    const pc = FakePC.instances[0];
+    pc.ondatachannel?.({ channel: pc.dc });
+    const dc = pc.dc;
+    dc.onmessage?.({ data: JSON.stringify({ k: 'meta', id: 'm-stop', type: 'file', from: 'remote-client', fromNickname: '对端', ts: Date.now(), size: 40000, fileName: 'a.bin', mimeType: 'application/octet-stream', chunks: 3 }) });
+    expect(items[0].status).toBe('receiving');
+
+    mesh.stop();
+    expect(items[0].status).toBe('cancelled');
+    expect((mesh as unknown as { peers: Map<string, unknown> }).peers.size).toBe(0);
+    expect((mesh as unknown as { replaced: boolean }).replaced).toBe(false);
   });
 });

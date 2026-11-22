@@ -29,13 +29,12 @@ function statusLabel(item: TimelineItem): { text: string; ok: boolean } {
   return { text: '发送失败：暂无其他成员在线', ok: false };
 }
 
-function serverWebSocketUrl(): string {
+function serverAgentUrl(): string {
   const params = new URLSearchParams(window.location.search);
-  const explicit = params.get('agentWs');
+  // agentUrl 为正式参数名；agentWs 保留兼容旧链接（ws/wss 会被归一为 http/https）
+  const explicit = params.get('agentUrl') ?? params.get('agentWs');
   if (explicit) return explicit;
-
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/browser`;
+  return '/browser';
 }
 
 function renderTextWithLinks(text: string) {
@@ -64,6 +63,8 @@ export default function Home() {
   const fileRef = useRef<HTMLInputElement>(null);
   const bubbleListRef = useRef<HTMLDivElement>(null);
   const objectUrlsRef = useRef<Set<string>>(new Set());
+  const itemsRef = useRef<TimelineItem[]>([]);
+  const nicknameFocusedRef = useRef(false);
   const [self, setSelf] = useState<SelfView>({ clientId: '', nickname: '', connected: false, replaced: false });
   const [peers, setPeers] = useState<PeerView[]>([]);
   const [items, setItems] = useState<TimelineItem[]>([]);
@@ -75,7 +76,7 @@ export default function Home() {
   const [connectFailed, setConnectFailed] = useState(false);
 
   useEffect(() => {
-    const mesh = new ShareMesh(serverWebSocketUrl(), {
+    const mesh = new ShareMesh(serverAgentUrl(), {
       onItem: (item) => {
         if (item.url) objectUrlsRef.current.add(item.url);
         setItems((prev) => {
@@ -90,7 +91,8 @@ export default function Home() {
       onSelf: (value) => {
         setSelf(value);
         connectedRef.current = value.connected;
-        if (value.nickname) setNickname(value.nickname);
+        // 用户正在编辑昵称时不要被服务器/本地事件覆盖
+        if (value.nickname && !nicknameFocusedRef.current) setNickname(value.nickname);
         if (value.connected) setConnectFailed(false);
       },
     });
@@ -103,12 +105,18 @@ export default function Home() {
     return () => {
       clearTimeout(timer);
       mesh.stop();
+      // 只回收当前列表已不再引用的 URL；StrictMode 双挂载时仍显示的图片不受影响
+      const live = new Set(itemsRef.current.map((entry) => entry.url).filter((url): url is string => Boolean(url)));
       for (const url of objectUrlsRef.current) {
-        URL.revokeObjectURL(url);
+        if (!live.has(url)) URL.revokeObjectURL(url);
       }
       objectUrlsRef.current.clear();
     };
   }, []);
+
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
 
   const sortedItems = useMemo(() => [...items].sort((a, b) => a.timestamp - b.timestamp), [items]);
 
@@ -306,6 +314,8 @@ export default function Home() {
                   onChange={(event) => setNickname(event.target.value)}
                   placeholder="例如：客厅的手机"
                   maxLength={40}
+                  onFocus={() => { nicknameFocusedRef.current = true; }}
+                  onBlur={() => { nicknameFocusedRef.current = false; }}
                   onKeyDown={(event) => { if (event.key === 'Enter') saveNickname(); }}
                 />
                 <button className="btn primary" type="button" onClick={saveNickname}>保存</button>
@@ -342,7 +352,7 @@ export default function Home() {
               <p className="hint">
                 在局域网一台设备上运行群聊服务器，其他设备浏览器打开同一个页面地址即可自动进群。
                 服务器只转发信令，消息与文件在浏览器之间直连传输。
-                如需连接其他服务器，可在地址后加 <code>?agentWs=ws://服务器地址:端口/browser</code>。
+                如需连接其他服务器，可在地址后加 <code>?agentUrl=/browser</code>（或完整 HTTP 地址）。
               </p>
             </div>
           </aside>

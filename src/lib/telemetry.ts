@@ -15,19 +15,32 @@ interface TelemetryPayload extends TelemetryContext {
   details?: Record<string, unknown>;
 }
 
+const TELEMETRY_ENABLED = process.env.NEXT_PUBLIC_TELEMETRY_ENABLED !== '0';
+
 let endpoint = '/log';
 let context: TelemetryContext = {};
 
+/** 线上构建可用 NEXT_PUBLIC_TELEMETRY_ENABLED=0 直接关闭前端埋点上报。 */
+export function telemetryEnabled(): boolean {
+  return TELEMETRY_ENABLED;
+}
+
 /**
- * 由信令地址推导埋点上报地址：ws://host/browser → http://host/log。
- * 页面与服务器同源时直接使用相对路径 /log。
+ * 由信令地址推导埋点上报地址：http(s)://host/browser → http(s)://host/log。
+ * 页面与服务器同源时等价于相对路径 /log。
  */
 export function initTelemetry(signalingUrl: string): void {
   if (typeof window === 'undefined') return;
   try {
     const url = new URL(signalingUrl, window.location.href);
-    if (url.protocol === 'ws:' || url.protocol === 'wss:') {
-      endpoint = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}/log`;
+    if (
+      url.protocol === 'ws:' ||
+      url.protocol === 'wss:' ||
+      url.protocol === 'http:' ||
+      url.protocol === 'https:'
+    ) {
+      const secure = url.protocol === 'wss:' || url.protocol === 'https:';
+      endpoint = `${secure ? 'https:' : 'http:'}//${url.host}/log`;
     }
   } catch {
     endpoint = '/log';
@@ -45,6 +58,7 @@ export function report(
   details?: Record<string, unknown>,
 ): void {
   if (typeof window === 'undefined') return;
+  if (!TELEMETRY_ENABLED) return;
   const payload: TelemetryPayload = {
     level,
     event,

@@ -21,9 +21,9 @@
 - 多语言；大规模成员数承诺（目标 ≤ 8 个浏览器客户端）。
 
 ## 3. 术语
-- **成员（client）**：一个打开页面的浏览器客户端，由 localStorage 中的 UUID 标识，可独立修改昵称。
-- **群聊服务器（agent）**：基于 Next.js 的自定义 Node.js 服务器，单个进程同时提供页面与 WebSocket 信令端点 `/browser`；不持有身份，不保存内容。
-- **网络组（room）**：按服务器观察到的来源地址归类的一组客户端。服务器在局域网内时来源是各设备自己的私网 IP，按 RFC1918 自然边界归组（10/8、172.16/12、192.168/16；IPv6 ULA/链路本地按 /64）；服务器在公网时来源是 NAT 之后的出口地址，按完整 IP 归组（IPv4-mapped IPv6 会先归一）。回环与 169.254 链路本地各自成组。
+- **成员（client）**：一个打开页面的浏览器客户端，由 sessionStorage 中的 UUID 标识（同一标签页刷新保持、不同标签页各自独立），可独立修改昵称。
+- **群聊服务器（agent）**：基于 Next.js 的应用（App Router + Route Handler），单个进程同时提供页面与信令端点 `/browser`（SSE 下行 + POST 上行）；不持有身份，不保存内容。
+- **网络组（room）**：按服务器观察到的来源地址归类的一组客户端。服务器在局域网内时来源是各设备自己的私网 IP，按 RFC1918 自然边界归组（10/8、172.16/12、192.168/16；IPv6 ULA 按 /64，链路本地统一成组）；服务器在公网时来源是 NAT 之后的出口地址，按完整 IP 归组（IPv4-mapped IPv6 会先归一）。回环与 169.254 链路本地各自成组。
 - **信令（signaling）**：建立 WebRTC 连接时交换的 SDP/ICE 消息，经服务器按 `toClient` 转发。
 - **消息（timeline item）**：群中一条文字/图片/文件记录，携带发送者 clientId 与昵称。
 
@@ -31,16 +31,16 @@
 
 ```
         ┌───────── 群聊服务器（一台自托管设备，单进程） ─────────┐
-        │  Next.js 页面（HTTP） + WS /browser 信令中继           │
+        │  Next.js 页面 + /browser（SSE/POST）信令中继          │
         └───────┬──────────────────────────────┬──────────────┘
-                │ WS                           │ WS
+                │ SSE 下行                       │ POST 上行
         ┌───────▼────────┐            ┌───────▼────────┐
         │ 浏览器成员 A    │            │ 浏览器成员 B    │
         └───────┬────────┘            └───────┬────────┘
                 └── WebRTC DataChannel 直传 ────┘
 ```
 
-- 控制面：浏览器只与群聊服务器建立一条 WS，用于注册、成员上下线通知和信令转发；服务器按来源地址把客户端分入不同网络组，所有成员列表与事件只在组内广播。
+- 控制面：浏览器只与群聊服务器保持一条 SSE 下行（用于成员列表、上下线通知和信令转发）与一条 POST 上行（注册信息随 SSE 的查询参数带上，控制消息走 POST）；服务器按来源地址把客户端分入不同网络组，所有成员列表与事件只在组内广播。
 - 数据面：成员之间全 mesh WebRTC DataChannel 直连，文字/图片/文件均走此通道。
 - 隔离边界：跨网络组的客户端收不到彼此的上线/下线/昵称事件，跨组 `signal` 由服务器直接丢弃——即使两端路由上偶然可达，也无法建立 DataChannel。
 - 部署：单个 Node 进程自托管，不再使用 Next 静态导出，因此不按纯静态站点部署到 Pages；可由反向代理暴露，此时设 `TRUST_PROXY=1`。
@@ -48,15 +48,15 @@
 ## 5. 运行模型
 
 ### 5.1 成员身份
-- 浏览器首次打开页面时生成 UUID，存入 `localStorage`（`local-share.client-id`），刷新后保持不变。
+- 浏览器首次打开页面时生成 UUID，存入 `sessionStorage`（`local-share.client-id`）：同一标签页刷新后保持不变，不同标签页各自独立（多标签页是不同成员）。
 - 默认昵称取自浏览器所在系统信息（如 Mac、Windows、Android、iPhone、iPad），由 `navigator.userAgent` / `userAgentData` 解析；用户可修改，存入 `localStorage`（`local-share.nickname`），不影响其他成员。
 - 昵称变更由服务器广播给其他成员；历史消息保留发送当时的昵称。
 - 同一网络组内出现相同昵称时，服务器在昵称后追加 5 位随机数字（如 `张三12345`）以区分；不同网络组互不影响。
 
 ### 5.2 启动
-- 在局域网一台设备上运行 `npm run build && npm start`（默认端口 3000）。
+- 在局域网一台设备上运行 `pnpm build && pnpm start`（默认端口 3000）。
 - 其他设备浏览器访问 `http://<服务器IP>:3000`，打开即自动入群。
-- 项目为单一包、单一服务器：`src/app/` 前端、`src/lib/` 共享逻辑、`src/server/` 服务端。`npm run dev` 直接以开发模式启动该服务器（默认 3000），页面与信令同进程同端口，改代码自动热重载。
+- 项目为单一包、单一 Next.js 应用：`src/app/` 前端与 Route Handler、`src/lib/` 共享逻辑、`src/lib/server/` 服务端。`pnpm dev` 直接以开发模式启动该应用（默认 3000），页面与信令同进程同端口，改代码自动热重载。
 
 ## 6. 功能需求
 
@@ -67,19 +67,19 @@
 - **FR-5 文件**：选择或拖入发送，单文件 ≤ 100MB，接收后显示文件名与大小并可下载。
 - **FR-6 界面**：消息气泡按时间正序排列，自己靠右、他人靠左，显示昵称、时间、传输状态；侧栏展示成员列表与昵称设置，成员区分"已连接 · 可直连"与"连接中…"（以 DataChannel 是否打开为准）。
 - **FR-7 传输反馈**：发送/接收进度条；传输中可取消；"已送达 x/y" 的 y 为**已发现的成员数**，未连通或未送达的成员计入未送达。
-- **FR-8 掉线重连**：浏览器 WS 断开后清除成员并关闭 DataChannel，2 秒后自动重连；离线期间内容不补发。
+- **FR-8 掉线重连**：浏览器信令断开后清除成员并关闭 DataChannel，2 秒后自动重连；离线期间内容不补发。
 - **FR-9 昵称管理**：昵称属于浏览器本地，修改后写入 localStorage 并同步给群内其他成员。同一网络组内昵称重复时，服务器在昵称后追加 5 位随机数字（如 `张三12345`）保证成员列表唯一，并把分配结果同步给该成员。
-
 ## 7. 消息格式
 
-### 7.1 浏览器 → 服务器（WS JSON）
+### 7.1 浏览器 → 服务器（POST `/browser`，JSON）
 ```json
-{ "t": "register", "clientId": "<uuid-v4>", "nickname": "<string>" }
-{ "t": "signal", "toClient": "<uuid-v4>", "data": { "description": "...", "candidate": "..." } }
-{ "t": "nickname", "nickname": "<string>" }
+{ "t": "signal", "clientId": "<uuid-v4>", "toClient": "<uuid-v4>", "data": { "description": "...", "candidate": "..." } }
+{ "t": "nickname", "clientId": "<uuid-v4>", "nickname": "<string>" }
 ```
 
-### 7.2 服务器 → 浏览器（WS JSON）
+注册（`clientId` + `nickname`）通过 `GET /browser?clientId=...&nickname=...` 的查询参数完成，不单独发 POST。
+
+### 7.2 服务器 → 浏览器（SSE `text/event-stream`，每帧一个 JSON）
 ```json
 { "t": "init", "clients": [{ "clientId": "<uuid-v4>", "nickname": "<string>" }] }
 { "t": "client-online", "clientId": "<uuid-v4>", "nickname": "<string>" }
@@ -87,6 +87,7 @@
 { "t": "peer-nickname", "clientId": "<uuid-v4>", "nickname": "<string>" }
 { "t": "nickname-assigned", "nickname": "<string>" }
 { "t": "signal", "fromClient": "<uuid-v4>", "data": { "description": "...", "candidate": "..." } }
+{ "t": "replaced" }
 ```
 
 - `nickname-assigned` 只在昵称与同组其他成员重复时下发，`nickname` 为追加 5 位随机数字后的最终昵称。
@@ -97,11 +98,11 @@
 
 ## 8. 接口约定
 
-- 浏览器 WS 地址默认与页面同源：`ws(s)://<页面host>/browser`；页面从其他地址托管时可用 `?agentWs=` 覆盖。
+- 浏览器信令地址默认与页面同源：`/browser`（GET 下行 SSE + POST 上行）；页面从其他地址托管时可用 `?agentUrl=` 覆盖为 `/browser` 或完整 HTTP 地址。
 - 服务器只按 `toClient` 转发信令，不解析 SDP，不保存任何消息或文件；跨网络组的 `toClient` 一律不转发。
-- 分组依据为服务端观察到的连接来源地址：直连部署取 socket 对端地址；位于受信反向代理之后时可设 `TRUST_PROXY=1`，改用 `X-Forwarded-For` 首段（Cloudflare 场景同理，用 `CF-Connecting-IP`）。未开启信任时不采信该头，避免伪造。
+- 分组依据为服务端观察到的请求来源地址：Cloudflare 部署用 `CF-Connecting-IP`；位于受信反向代理之后时可设 `TRUST_PROXY=1`，改用 `X-Forwarded-For` 首段。直连部署（`next start` 直接暴露）拿不到来源地址，全部并入 `direct` 组。未开启信任时不采信 `X-Forwarded-For`，避免伪造。
 - 分组精度：私网按 RFC1918 块边界、公网按完整地址，属于启发式——同一私网块内被刻意隔离的子网会被并组；共用同一公网出口的网络必然同组。
-- 同一网络组内同一 `clientId` 重复连接时，旧连接被关闭，保证一个浏览器成员只有一个有效连接。
+- 同一网络组内同一 `clientId` 重复连接时，旧连接收到 `replaced` 后被关闭，保证一个浏览器成员只有一个有效连接。
 
 ## 9. 非功能需求
 
@@ -126,12 +127,14 @@
 
 - 不保留历史：页面刷新或离开后，之前的消息不可见。
 - 无鉴权，任何能访问页面的设备都可加入。
-- 页面由本服务器自身提供；如确需从其他地址加载页面，可通过 `?agentWs` 指向信令服务器。
+- 页面由本服务器自身提供；如确需从其他地址加载页面，可通过 `?agentUrl` 指向信令服务器。
 - "同一网络"以来源出口地址判定，是启发式而非严格二层定义：共用出口的不同内网会被并为一组（若内部被 ACL 隔离则表现为可见但连不上）；同一内网多出口或一端走 VPN 会被拆开。
 
 ## 12. 部署
 
-- 构建：`npm run build`，产出 `.next/`（Next 页面）与 `dist/`（服务端）；`npm start` 以生产模式启动单个 Node 进程（默认 3000，可用 `PORT` 覆盖）。
-- 局域网使用：`npm start` 在局域网一台设备启动服务器，其他设备访问 `http://<该设备IP>:3000`。
-- 自托管：VPS / 家庭主机 / 容器均可，建议用 systemd 或 Docker 常驻。项目不再是 `output: 'export'` 的纯静态站点，Cloudflare Pages 静态托管方案已不适用。
+- 构建：`pnpm build`，产出 `.next/`；`pnpm start` 以生产模式启动单个 Node 进程（默认 3000，可用 `PORT` 覆盖）。
+- 局域网使用：`pnpm start` 在局域网一台设备启动服务器，其他设备访问 `http://<该设备IP>:3000`。
+- 自托管：VPS / 家庭主机 / 容器均可，建议用 systemd 或 Docker 常驻。
+- 云端部署：后端仅为 Next.js Route Handler（SSE + POST），可部署到任何支持 Next.js 的平台。Cloudflare Workers（OpenNext/vinext）上运行时，信令中继状态需要单一协调点（Durable Object），否则多 isolate 之间成员列表不一致；接入后再补充对应配置。
+- 埋点：默认开启；线上构建设 `NEXT_PUBLIC_TELEMETRY_ENABLED=0` 关闭前端上报，或服务端设 `TELEMETRY_ENABLED=0` 直接丢弃。
 - CI：GitHub Actions 在 push/PR 上执行安装、类型检查、测试与构建校验（见 `.github/workflows/ci.yml`）。

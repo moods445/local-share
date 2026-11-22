@@ -1,6 +1,7 @@
 'use client';
 
 import { initTelemetry, report, setTelemetryContext } from './telemetry';
+import { SseAgentSocket, SOCKET_OPEN, type AgentSocket } from './agent-socket';
 
 export type ContentType = 'text' | 'image' | 'file';
 export type ItemStatus = 'sending' | 'sent' | 'partial' | 'receiving' | 'received' | 'failed' | 'cancelled';
@@ -80,6 +81,10 @@ const HEADER_BYTES = ID_BYTES + 4;
 const BUFFERED_LIMIT = 1 << 20;
 const CONNECT_TIMEOUT_MS = 5000;
 const RECONNECT_DELAY_MS = 2000;
+const PEER_RECONNECT_DELAY_MS = 800;
+const MAX_PEER_RETRIES = 5;
+const MAX_SEEN_IDS = 500;
+const MAX_CHUNKS = 10_000;
 const CLIENT_ID_KEY = 'local-share.client-id';
 const NICKNAME_KEY = 'local-share.nickname';
 
@@ -210,15 +215,22 @@ function waitForDrain(dc: RTCDataChannel): Promise<void> {
   });
 }
 
+export interface ShareMeshOptions {
+  /** 测试用：注入信令传输实现，默认走 SSE + POST */
+  createSocket?: (agentUrl: string, clientId: string, nickname: string) => AgentSocket;
+}
+
 export class ShareMesh {
   private clientId = loadClientId();
   private nickname = loadNickname();
-  private socket?: WebSocket;
+  private socket?: AgentSocket;
   private peers = new Map<string, PeerView>();
   private pcs = new Map<string, RTCPeerConnection>();
   private channels = new Map<string, RTCDataChannel>();
   private makingOffer = new Set<string>();
   private ignoringOffer = new Map<string, boolean>();
+  private retries = new Map<string, number>();
+  private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private incoming = new Map<string, Incoming>();
   private seen = new Set<string>();
   private items = new Map<string, TimelineItem>();
@@ -229,12 +241,17 @@ export class ShareMesh {
   private stopped = false;
   private events: MeshEvents;
 
-  constructor(private agentUrl: string, events: MeshEvents) {
+  constructor(
+    private agentUrl: string,
+    events: MeshEvents,
+    private meshOptions: ShareMeshOptions = {},
+  ) {
     this.events = events;
   }
 
   start(): void {
     this.stopped = false;
+    this.replaced = false;
     initTelemetry(this.agentUrl);
     setTelemetryContext({ clientId: this.clientId, nickname: this.nickname });
     report('info', 'mesh.start', { url: this.agentUrl });
@@ -247,9 +264,19 @@ export class ShareMesh {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
     this.socket?.close();
+    this.socket = undefined;
     for (const pc of this.pcs.values()) pc.close();
     this.pcs.clear();
     this.channels.clear();
+    this.peers.clear();
+    this.makingOffer.clear();
+    this.ignoringOffer.clear();
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
+    this.retries.clear();
+    this.abortIncoming();
+    this.replaced = false;
+    this.events.onPeers([]);
   }
 
   setNickname(nickname: string): void {
@@ -363,11 +390,25 @@ export class ShareMesh {
     });
   }
 
+  private createSocket(): AgentSocket {
+    if (this.meshOptions.createSocket) {
+      return this.meshOptions.createSocket(this.agentUrl, this.clientId, this.nickname);
+    }
+    const base = typeof window !== 'undefined' ? window.location.href : 'http://localhost/';
+    const stream = new URL(this.agentUrl, base);
+    stream.searchParams.set('clientId', this.clientId);
+    stream.searchParams.set('nickname', this.nickname);
+    return new SseAgentSocket({
+      streamUrl: stream.toString(),
+      postUrl: new URL(this.agentUrl, base).toString(),
+    });
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const attempt = (this.attempts += 1);
     report('info', 'ws.connecting', { attempt, url: this.agentUrl });
-    const socket = new WebSocket(this.agentUrl);
+    const socket = this.createSocket();
     this.socket = socket;
     let settled = false;
     this.connectTimer = setTimeout(() => {
@@ -377,6 +418,8 @@ export class ShareMesh {
         readyState: socket.readyState,
         timeoutMs: CONNECT_TIMEOUT_MS,
       });
+      // 连接挂起（服务器不回响应头、反代缓冲等）：主动断开，走 onclose 的重连逻辑
+      socket.close(1006, 'connect timeout');
     }, CONNECT_TIMEOUT_MS);
     const settle = () => {
       settled = true;
@@ -387,7 +430,8 @@ export class ShareMesh {
       settle();
       report('info', 'ws.open', { attempt });
       this.emitSelf(true);
-      this.sendToAgent({ t: 'register', clientId: this.clientId, nickname: this.nickname });
+      // 注册用的昵称是建连时快照的；连上后补发一次，避免连接窗口内改昵称被丢
+      this.sendToAgent({ t: 'nickname', nickname: this.nickname });
     };
     socket.onmessage = (event) => {
       let msg: Record<string, unknown>;
@@ -424,6 +468,7 @@ export class ShareMesh {
     socket.onerror = () => {
       report('warn', 'ws.error', { attempt, readyState: socket.readyState });
     };
+    socket.connect();
   }
 
   private onAgentMessage(msg: Record<string, unknown>): void {
@@ -447,8 +492,20 @@ export class ShareMesh {
         break;
       }
       case 'client-online': {
-        report('debug', 'peer.online', { clientId: String(msg.clientId) });
-        this.addRemoteClient(String(msg.clientId), String(msg.nickname || '未命名成员'));
+        const clientId = String(msg.clientId);
+        report('debug', 'peer.online', { clientId });
+        if (clientId === this.clientId) break;
+        const nickname = String(msg.nickname || '未命名成员');
+        if (this.peers.has(clientId)) {
+          // 同一 clientId 重复上线（多标签页替换/重连竞态）：旧连接可能已失效，
+          // 关掉旧 PC 重建，避免复用死通道导致该成员永远“连接中”
+          this.peers.get(clientId)!.nickname = nickname;
+          this.teardownPeer(clientId);
+        } else {
+          this.peers.set(clientId, { clientId, nickname, state: 'connecting' });
+        }
+        this.emitPeers();
+        this.setupPeer(clientId);
         break;
       }
       case 'client-offline': {
@@ -497,14 +554,37 @@ export class ShareMesh {
 
   private removeRemoteClient(clientId: string): void {
     if (!this.peers.delete(clientId)) return;
+    const timer = this.retryTimers.get(clientId);
+    if (timer) clearTimeout(timer);
+    this.retryTimers.delete(clientId);
+    this.retries.delete(clientId);
+    this.teardownPeer(clientId);
+    this.abortIncoming(clientId);
+    this.emitPeers();
+  }
+
+  /** 关闭并清理一个成员的 WebRTC 连接与协商状态（成员本身仍保留）。 */
+  private teardownPeer(clientId: string): void {
     const pc = this.pcs.get(clientId);
     if (pc) pc.close();
     this.pcs.delete(clientId);
     this.channels.delete(clientId);
     this.makingOffer.delete(clientId);
     this.ignoringOffer.delete(clientId);
-    this.abortIncoming(clientId);
-    this.emitPeers();
+  }
+
+  /** DataChannel 意外断开后，在成员仍在线的前提下重建连接（有重试上限）。 */
+  private schedulePeerReconnect(clientId: string): void {
+    const count = this.retries.get(clientId) ?? 0;
+    if (count >= MAX_PEER_RETRIES) return;
+    this.retries.set(clientId, count + 1);
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(clientId);
+      this.retries.delete(clientId);
+      if (this.stopped || !this.peers.has(clientId) || this.channels.has(clientId)) return;
+      this.setupPeer(clientId);
+    }, PEER_RECONNECT_DELAY_MS);
+    this.retryTimers.set(clientId, timer);
   }
 
   private setupPeer(clientId: string): void {
@@ -560,11 +640,17 @@ export class ShareMesh {
     dc.onclose = () => {
       report('info', 'peer.channel_closed', { clientId });
       this.channels.delete(clientId);
+      const pc = this.pcs.get(clientId);
+      if (pc) pc.close();
+      this.pcs.delete(clientId);
+      this.makingOffer.delete(clientId);
+      this.ignoringOffer.delete(clientId);
       const peer = this.peers.get(clientId);
       if (peer && peer.state === 'connected') {
         peer.state = 'connecting';
         this.emitPeers();
       }
+      this.schedulePeerReconnect(clientId);
     };
   }
 
@@ -620,6 +706,12 @@ export class ShareMesh {
     const peer = this.peers.get(clientId);
     if (frame.k === 'meta') {
       if (this.seen.has(frame.id)) return;
+      // 分片数必须与声明大小一致且在上限内，避免恶意/异常帧撑爆内存
+      const expected = Math.max(1, Math.ceil(frame.size / CHUNK_SIZE));
+      if (!Number.isInteger(frame.chunks) || frame.chunks < 1 || frame.chunks > expected || frame.chunks > MAX_CHUNKS) {
+        return;
+      }
+      if (this.seen.size >= MAX_SEEN_IDS) this.seen.clear();
       this.seen.add(frame.id);
       const chunks = new Array<ArrayBuffer | undefined>(frame.chunks);
       this.incoming.set(frame.id, { meta: frame, chunks, received: 0, from: clientId });
@@ -679,8 +771,11 @@ export class ShareMesh {
     const decoded = decodeChunk(data);
     if (!decoded) return;
     const incoming = this.incoming.get(decoded.id);
-    if (!incoming || incoming.chunks[decoded.index]) return;
-    incoming.chunks[decoded.index] = decoded.payload;
+    if (!incoming) return;
+    const index = decoded.index;
+    if (!Number.isInteger(index) || index < 0 || index >= incoming.chunks.length) return;
+    if (incoming.chunks[index]) return;
+    incoming.chunks[index] = decoded.payload;
     incoming.received += 1;
     const item = this.items.get(decoded.id);
     if (!item) return;
@@ -718,7 +813,9 @@ export class ShareMesh {
   }
 
   private sendToAgent(message: Record<string, unknown>): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
+    if (this.socket?.readyState !== SOCKET_OPEN) return;
+    // POST 上行没有连接态，必须自己带上 clientId 让服务器知道来源
+    this.socket.send(JSON.stringify({ clientId: this.clientId, ...message }));
   }
 
   private updateItem(item: TimelineItem): void {
@@ -734,7 +831,7 @@ export class ShareMesh {
     this.events.onSelf({
       clientId: this.clientId,
       nickname: this.nickname,
-      connected: connected ?? this.socket?.readyState === WebSocket.OPEN,
+      connected: connected ?? this.socket?.readyState === SOCKET_OPEN,
       replaced: this.replaced,
     });
   }
